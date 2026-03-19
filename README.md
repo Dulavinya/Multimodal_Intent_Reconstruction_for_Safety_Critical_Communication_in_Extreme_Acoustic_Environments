@@ -21,6 +21,10 @@ Project repository for the hackathon submission: robustly inferring short safety
 - **Goal**: Use multimodal inputs — noisy short audio commands + time-series sensor data (temperature, vibration, pressure, machine states) — to infer the intended safety command and a reliability score, and generate a clear alert.
 - **High-level approach**: 1) learn robust speech representations (self-supervised / masked predictive learning); 2) encode sensor time-series; 3) fuse modalities with an uncertainty-aware mechanism; 4) output command + reliability and optionally synthesize a spoken alert.
 
+## Architecture
+
+![Architecture](Architecture.jpeg)
+
 **Generative AI Application**
 - **Representation learning**: Use self-supervised / generative representation learning on raw audio (masked predictive objectives). Models/ideas: `wav2vec 2.0`, `HuBERT`, CPC, or research-style masked predictive encoders inspired by AJEPA. These learn features that are robust to corruption/noise.
 - **Alert synthesis**: For final user-facing alerts, use deterministic templated messages (recommended for safety) and optionally a neural TTS (e.g., Tacotron2 + HiFi-GAN or cloud TTS) if a synthetic voice is required.
