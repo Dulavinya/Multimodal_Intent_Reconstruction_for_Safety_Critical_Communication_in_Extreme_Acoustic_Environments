@@ -10,12 +10,12 @@ Two modes:
 import torch
 from typing import Optional, Dict, Any
 
-from .encoders import AudioJEPAEncoder, SensorEncoder
+from .encoders import WavJEPAEncoder, SensorEncoder
 from .fusion import CrossAttentionFusion
 from .classification import CommandClassifier, mc_dropout_inference
 from .synthesis import CleanAudioSynthesizer
 from .alert import generate_alert
-from .utils import waveform_to_mel, COMMAND_VOCAB
+from .utils import COMMAND_VOCAB
 
 
 class AthenAISystem:
@@ -27,7 +27,7 @@ class AthenAISystem:
         assert mode in ('base', 'full'), "mode must be 'base' or 'full'"
         self.mode = mode
 
-        self.audio_encoder = AudioJEPAEncoder(embed_dim=768)
+        self.audio_encoder = WavJEPAEncoder()
         self.classifier = CommandClassifier(
             input_dim=768 if mode == 'base' else 512
         )
@@ -59,11 +59,8 @@ class AthenAISystem:
         Returns:
             dict with keys: command, confidence, uncertainty, clean_audio, alert
         """
-        # ── Preprocessing ────────────────────────────────────────────────────
-        mel = waveform_to_mel(noisy_waveform)          # [B, 1, n_mels, T_frames]
-
         # ── Phase 0: Encoding ─────────────────────────────────────────────────
-        speech_emb = self.audio_encoder(mel)           # [B, N_patches, 768]
+        speech_emb = self.audio_encoder(noisy_waveform)           # [B, N, 768]
 
         if self.mode == 'full' and sensor_window is not None:
             sensor_emb = self.sensor_encoder(sensor_window)        # [B, 256]

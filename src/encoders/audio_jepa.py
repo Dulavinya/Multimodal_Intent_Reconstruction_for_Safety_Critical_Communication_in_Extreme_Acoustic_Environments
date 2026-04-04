@@ -1,40 +1,43 @@
 """
-Audio-JEPA Encoder
-Operates on mel-spectrogram patches using a ViT backbone.
-Uses a momentum-updated target encoder (EMA) and a context encoder trained via gradient descent.
+WavJEPA audio encoder.
+Encodes raw 16 kHz waveforms with the WavJEPA-NAT backbone.
 """
 
-import copy
 import torch
 import torch.nn as nn
-from transformers import ViTModel
+from transformers import AutoFeatureExtractor, AutoModel
 
 
-class AudioJEPAEncoder(nn.Module):
-    def __init__(self, embed_dim: int = 768, patch_size: int = 16, n_mels: int = 128):
+class WavJEPAEncoder(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.patch_embed = nn.Conv2d(1, embed_dim, patch_size, patch_size)
-        self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224')
+        self.model = AutoModel.from_pretrained('labhamlet/wavjepa-nat-base')
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained('labhamlet/wavjepa-nat-base')
 
-        # EMA (momentum) target encoder — frozen, updated manually
-        self.target_encoder = copy.deepcopy(self.vit)
-        for p in self.target_encoder.parameters():
-            p.requires_grad = False
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        self.model.eval()
 
-    def forward(self, mel_spec: torch.Tensor) -> torch.Tensor:
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            mel_spec: [B, 1, n_mels, T]  — single-channel log-mel spectrogram
+            waveform: [B, T] raw 16 kHz audio waveforms
         Returns:
-            context_emb: [B, N_patches, embed_dim]
+            last_hidden_state: [B, N, 768]
         """
-        patches = self.patch_embed(mel_spec)           # [B, D, H', W']
-        patches = patches.flatten(2).transpose(1, 2)   # [B, N, D]
-        context_emb = self.vit(inputs_embeds=patches).last_hidden_state
-        return context_emb                             # [B, N, embed_dim]
+        if waveform.dim() != 2:
+            raise ValueError(f"waveform must have shape [B, T], got {tuple(waveform.shape)}")
 
-    @torch.no_grad()
-    def update_target(self, momentum: float = 0.996):
-        """EMA update: target ← momentum * target + (1 - momentum) * context"""
-        for p_ctx, p_tgt in zip(self.vit.parameters(), self.target_encoder.parameters()):
-            p_tgt.data = momentum * p_tgt.data + (1 - momentum) * p_ctx.data
+        device = waveform.device
+        inputs = self.feature_extractor(
+            [sample.detach().cpu().numpy() for sample in waveform],
+            sampling_rate=16000,
+            return_tensors='pt',
+            padding=True,
+        )
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+
+        return outputs.last_hidden_state

@@ -1,4 +1,4 @@
-from .audio_jepa import AudioJEPAEncoder
+from .audio_jepa import WavJEPAEncoder
 from .sensor_encoder import SensorEncoder
 
-__all__ = ["AudioJEPAEncoder", "SensorEncoder"]
+__all__ = ["WavJEPAEncoder", "SensorEncoder"]
