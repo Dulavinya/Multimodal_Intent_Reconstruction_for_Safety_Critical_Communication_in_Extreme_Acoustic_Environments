@@ -1,0 +1,97 @@
+<scratchpad>
+Summary of What Exists
+AthenAI is a well-structured 7-module Python prototype for safety command inference in noisy industrial environments. All modules are coherent, properly import from each other, and the inference pipeline is complete. However, it has never been trained. It is a skeleton awaiting data and training.
+
+Core modules: AudioJEPAEncoder (ViT), SensorEncoder (Transformer), CrossAttentionFusion (8-head cross-attention), CommandClassifier (MLP + MC Dropout), CleanAudioSynthesizer (AudioGen), LLMAlert (OpenAI), Pipeline (AthenAISystem).
+
+Critical Issue: The Audio-JEPA Is Not JEPA
+Reading src/encoders/audio_jepa.py directly reveals the problem. The class:
+
+Loads google/vit-base-patch16-224 — an image ViT pretrained on ImageNet
+Has a target_encoder (EMA copy) that is never called in forward()
+Has no masking strategy, no predictor network, no JEPA training objective
+Is essentially: mel-spectrogram → Conv2d patch embed → ViT → embeddings
+This is a ViT feature extractor, not a JEPA. It will work but lacks the noise robustness that comes from proper JEPA self-supervised training.
+
+What Is Missing
+No actual datasets downloaded
+No data mixing pipeline (speech + noise at variable SNRs)
+No training script (neither JEPA pretraining nor supervised fine-tuning)
+No evaluation code
+Audio-JEPA Resource Evaluation
+Sony CSL audio-representations: True JEPA but checkpoints deleted, author abandoned project. Reference only.
+WavJEPA-Base (labhamlet): True JEPA, works on raw waveforms, pretrained weights on HuggingFace, active.
+WavJEPA-Nat-Base (labhamlet): Same architecture, additionally trained on 85k noisy/reverberant room simulations at SNR 5–40 dB. This is the right encoder for industrial noise scenarios.
+</scratchpad>
+<explanation>
+Current State of AthenAI — Plain English Walkthrough
+What Has Been Built
+The project has a complete, well-organized inference pipeline. Think of it as a fully assembled car with no fuel and no engine break-in — it has all the right parts in the right places, but it has never actually run on real data.
+
+Here's what each piece does:
+
+Audio Encoder: Takes noisy speech, converts it to patches (like cutting a spectrogram into a grid of tiles), and produces a sequence of embedding vectors representing what was said
+Sensor Encoder: Takes 8 industrial sensor readings over time and compresses them into a single embedding vector representing the machine's current state
+Fusion Module: Uses cross-attention so the sensor context can "modulate" the speech understanding — for example, if pressure is spiking, the model should favor "increase pressure" or "decrease pressure" as the likely command
+Classifier: Takes the fused embedding and outputs one of 20 safety commands, plus a confidence score and entropy-based uncertainty
+Synthesizer: Once a command is identified, generates a clean audio clip of that command using Meta's AudioGen
+Alert Generator: Sends the command + confidence to an LLM and gets back a structured safety alert for the operator
+The two-mode design (base vs full) is smart — it lets you deploy audio-only when sensors aren't available, and the full multimodal system when they are.
+
+The Big Problem: The Audio Encoder Is Not What It Claims To Be
+This is the most important thing to understand. The file src/encoders/audio_jepa.py is called "Audio-JEPA" but it is not a JEPA implementation. Here's why that matters:
+
+What JEPA actually does: It trains an encoder by masking parts of the input (like hiding 50% of a spectrogram) and making the model predict the embedding of the hidden parts from the visible parts. This is why JEPA encoders are particularly good at noisy audio — they learn to infer meaning from incomplete, corrupted signals.
+
+What the current code actually does: It loads a ViT that was pretrained on ImageNet (photos of dogs, cars, flowers) and repurposes it for mel-spectrograms via a patch embedding layer. An EMA target encoder exists in the code but is never called during inference. There is no masking, no predictor, no JEPA training.
+
+This isn't broken — the ViT will still produce useful audio embeddings. But it won't have the noise robustness that a properly trained audio JEPA would provide.
+
+Where to Begin and How to Start Training
+The training roadmap has 5 steps, in order:
+
+Set up the environment — install dependencies, verify GPU
+Get the data — download Google Speech Commands (for speech), MS-SNSD (for industrial noise), SKAB (for sensor readings)
+Replace the audio encoder — swap the ImageNet ViT for WavJEPA-Nat-Base, a true JEPA encoder with pretrained weights that was specifically trained for noisy environments
+Build the data mixing pipeline — write code to combine speech + noise at different SNR levels and pair with sensor readings
+Train and evaluate — train the fusion + classifier layers while keeping the audio encoder frozen (transfer learning)
+The Audio-JEPA Resources You Found
+Sony CSL (audio-representations): Cannot be used. The author accidentally deleted the pretrained weights and has left the project entirely. You can read their code for architectural ideas, but there's nothing to download or run.
+
+WavJEPA (labhamlet/wavjepa): This is the one you want. Specifically labhamlet/wavjepa-nat-base. It is:
+
+A true JEPA architecture (waveform → ViT context encoder + EMA target encoder + ViT predictor)
+Pretrained on AudioSet (1.74M audio clips)
+Additionally trained with 85,000 simulated noisy room environments (SNR 5–40 dB) — the closest published training condition to your industrial scenario
+0.2B parameters, MIT licensed, Transformers-compatible, actively maintained (November 2025)
+Takes raw 16kHz waveforms as input (simpler than mel-spectrogram preprocessing)
+This replaces your current AudioJEPAEncoder and requires only three pipeline adjustments: remove mel-spec preprocessing, update the encoder loading code, update the import. Everything else stays the same.
+
+The Documentation File
+The plan contains the full draft of RESEARCH_GUIDE.md — a comprehensive single-file reference document that covers all of the above, plus the dataset strategy, training steps with ready-to-use agent prompts, and a list of known gaps. Each training step includes a detailed prompt you can hand directly to an AI coding agent to implement without writing any code yourself.
+
+</explanation>
+After your review of the plan, I'll create RESEARCH_GUIDE.md in the project root with all of this documented.
+
+Claude’s Plan moonlit-strolling-cocke.md
+
+
+RESEARCH_GUIDE.md has been created. Here's a quick summary of what's in it:
+
+Sections 1–3: Project overview, full architecture diagram, and a status table showing what's built vs. what's missing.
+
+Section 4 (Critical Finding): Explains clearly why the current AudioJEPAEncoder is not actually JEPA — it's an ImageNet ViT with an unused EMA copy. No masking, no predictor, no JEPA training.
+
+Section 5–6: Side-by-side evaluation of Sony CSL (dead end — weights deleted, author gone) vs. WavJEPA. Recommends labhamlet/wavjepa-nat-base — a true JEPA trained specifically on noisy/reverberant scenes, with pretrained weights ready to download.
+
+Section 7: Dataset strategy with sourcing table for speech, noise, and sensor data.
+
+Section 8 (Training Roadmap): 5 sequential steps, each with a copy-paste agent prompt:
+
+Step 0: Environment setup
+Step 1: Download datasets
+Step 2: Build data mixing pipeline (speech + noise at variable SNRs)
+Step 3: Swap audio encoder for WavJEPA-Nat-Base
+Step 4: Training script (frozen encoder + trainable fusion + classifier)
+Step 5: Evaluation (accuracy, per-SNR breakdown, ECE calibration, reliability diagram)
+Section 9: Known gaps, research improvements, and safety considerations for deployment.
