@@ -11,8 +11,14 @@ from transformers import AutoFeatureExtractor, AutoModel
 class WavJEPAEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.model = AutoModel.from_pretrained('labhamlet/wavjepa-nat-base')
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained('labhamlet/wavjepa-nat-base')
+        self.model = AutoModel.from_pretrained(
+            'labhamlet/wavjepa-nat-base',
+            trust_remote_code=True,
+        )
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
+            'labhamlet/wavjepa-nat-base',
+            trust_remote_code=True,
+        )
 
         for parameter in self.model.parameters():
             parameter.requires_grad = False
@@ -35,9 +41,25 @@ class WavJEPAEncoder(nn.Module):
             return_tensors='pt',
             padding=True,
         )
-        inputs = {key: value.to(device) for key, value in inputs.items()}
+        input_values = inputs['input_values'].to(device)
 
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            outputs = self.model(input_values)
 
-        return outputs.last_hidden_state
+        if hasattr(outputs, 'last_hidden_state'):
+            hidden = outputs.last_hidden_state
+        elif isinstance(outputs, (tuple, list)) and len(outputs) > 0 and torch.is_tensor(outputs[0]):
+            hidden = outputs[0]
+        elif torch.is_tensor(outputs):
+            hidden = outputs
+        else:
+            raise TypeError(f"Unsupported WavJEPA output type: {type(outputs)}")
+
+        # WavJEPANat may return [B, C, N, D]; collapse channel views to [B, N, D].
+        if hidden.dim() == 4:
+            hidden = hidden.mean(dim=1)
+
+        if hidden.dim() != 3:
+            raise ValueError(f"Expected hidden state shape [B, N, D], got {tuple(hidden.shape)}")
+
+        return hidden

@@ -14,6 +14,7 @@ import argparse
 import csv
 import importlib.util
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -26,6 +27,7 @@ import torchaudio
 from sklearn.metrics import accuracy_score, classification_report
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -200,6 +202,7 @@ def run_epoch(
     device: torch.device,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
+    desc: str = "",
 ) -> Tuple[float, float, List[int], List[int]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -208,7 +211,8 @@ def run_epoch(
     all_preds: List[int] = []
     all_targets: List[int] = []
 
-    for audio, sensor, targets in loader:
+    progress = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    for audio, sensor, targets in progress:
         audio = audio.to(device, non_blocking=True)
         sensor = sensor.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
@@ -233,8 +237,10 @@ def run_epoch(
         all_preds.extend(preds.detach().cpu().tolist())
         all_targets.extend(targets.detach().cpu().tolist())
 
-    average_loss = total_loss / len(loader.dataset)
-    accuracy = accuracy_score(all_targets, all_preds)
+        progress.set_postfix(loss=f"{loss.item():.4f}")
+
+    average_loss = total_loss / max(1, len(all_targets))
+    accuracy = float(accuracy_score(all_targets, all_preds))
     return average_loss, accuracy, all_preds, all_targets
 
 
@@ -266,6 +272,12 @@ def main() -> None:
     parser.add_argument("--mode", type=str, choices=("base", "full"), default="full")
     args = parser.parse_args()
 
+    warnings.filterwarnings(
+        "ignore",
+        message="The PyTorch API of MaskedTensors is in prototype stage and will change in the near future.*",
+        category=UserWarning,
+    )
+
     set_seed(42)
 
     project_root = PROJECT_ROOT
@@ -293,6 +305,7 @@ def main() -> None:
             device=device,
             criterion=criterion,
             optimizer=optimizer,
+            desc=f"Epoch {epoch:03d} Train",
         )
 
         val_loss, val_accuracy, _, _ = run_epoch(
@@ -301,10 +314,13 @@ def main() -> None:
             device=device,
             criterion=criterion,
             optimizer=None,
+            desc=f"Epoch {epoch:03d} Val",
         )
 
-        print(
-            f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_accuracy={val_accuracy:.4f}"
+        summary = (
+            f"Epoch {epoch:03d} | "
+            f"train_loss={train_loss:.4f} | train_acc={train_accuracy:.4f} | "
+            f"val_loss={val_loss:.4f} | val_acc={val_accuracy:.4f}"
         )
 
         if val_loss < best_val_loss:
@@ -312,8 +328,10 @@ def main() -> None:
             best_epoch = epoch
             patience_counter = 0
             save_checkpoint(checkpoint_path, model, optimizer, epoch, val_loss, args.mode)
+            print(summary + " | best=updated")
         else:
             patience_counter += 1
+            print(summary + f" | patience={patience_counter}/{patience}")
             if patience_counter >= patience:
                 print(f"Early stopping triggered at epoch {epoch}; best epoch was {best_epoch}")
                 break
