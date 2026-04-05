@@ -53,6 +53,16 @@ mc_dropout_inference = load_symbol(
     PROJECT_ROOT / "src" / "classification" / "command_classifier.py",
     "mc_dropout_inference",
 )
+IntentQueryDecoder = load_symbol(
+    "athenai_intent_query_decoder_eval",
+    PROJECT_ROOT / "src" / "classification" / "intent_query_decoder.py",
+    "IntentQueryDecoder",
+)
+mc_dropout_inference_iqd = load_symbol(
+    "athenai_intent_query_decoder_eval",
+    PROJECT_ROOT / "src" / "classification" / "intent_query_decoder.py",
+    "mc_dropout_inference_iqd",
+)
 WavJEPAEncoder = load_symbol(
     "athenai_audio_jepa_eval",
     PROJECT_ROOT / "src" / "encoders" / "audio_jepa.py",
@@ -139,9 +149,10 @@ class SafetyCommandDataset(Dataset):
 
 
 class AthenAIModel(nn.Module):
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, decoder_type: str = "fc"):
         super().__init__()
         self.mode = mode
+        self.decoder_type = decoder_type
         self.audio_encoder = WavJEPAEncoder()
         for parameter in self.audio_encoder.parameters():
             parameter.requires_grad = False
@@ -151,7 +162,15 @@ class AthenAIModel(nn.Module):
             self.fusion = CrossAttentionFusion()
             self.classifier = CommandClassifier(input_dim=512)
         else:
-            self.classifier = CommandClassifier(input_dim=768)
+            if decoder_type == "iqd":
+                self.classifier = IntentQueryDecoder(
+                    n_commands=len(COMMAND_VOCAB),
+                    query_dim=768,
+                    n_heads=8,
+                    dropout=0.3,
+                )
+            else:
+                self.classifier = CommandClassifier(input_dim=768)
 
     def forward_features(self, audio: torch.Tensor, sensor: torch.Tensor | None = None) -> torch.Tensor:
         with torch.no_grad():
@@ -162,6 +181,10 @@ class AthenAIModel(nn.Module):
                 raise ValueError("sensor tensor is required in full mode")
             sensor_emb = self.sensor_encoder(sensor)
             return self.fusion(speech_emb, sensor_emb)
+
+        if self.decoder_type == "iqd":
+            # Return full sequence for IQD — do NOT mean-pool
+            return speech_emb
 
         return speech_emb.mean(dim=1)
 
@@ -287,6 +310,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate AthenAI on the test split")
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "best_model.pt")
     parser.add_argument("--mode", type=str, choices=("base", "full"), default="full")
+    parser.add_argument("--decoder", type=str, choices=("fc", "iqd"), default="fc",
+                        help="'iqd' for Intent Query Decoder, 'fc' for FC baseline")
     parser.add_argument("--batch_size", type=int, default=32)
     args = parser.parse_args()
 
@@ -296,7 +321,7 @@ def main() -> None:
     test_loader = build_test_loader(data_dir, args.batch_size)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AthenAIModel(mode=args.mode).to(device)
+    model = AthenAIModel(mode=args.mode, decoder_type=args.decoder).to(device)
     load_checkpoint(args.checkpoint, model, device)
     model.eval()
 
@@ -316,11 +341,18 @@ def main() -> None:
             else:
                 features = model.forward_features(audio)
 
-            pred_cmd, confidence, uncertainty = mc_dropout_inference(
-                model.classifier,
-                features,
-                n_passes=20,
-            )
+            if model.decoder_type == "iqd":
+                pred_cmd, confidence, uncertainty = mc_dropout_inference_iqd(
+                    model.classifier,
+                    features,
+                    n_passes=20,
+                )
+            else:
+                pred_cmd, confidence, uncertainty = mc_dropout_inference(
+                    model.classifier,
+                    features,
+                    n_passes=20,
+                )
 
             all_targets.extend(targets.tolist())
             all_predictions.extend(pred_cmd.detach().cpu().tolist())
