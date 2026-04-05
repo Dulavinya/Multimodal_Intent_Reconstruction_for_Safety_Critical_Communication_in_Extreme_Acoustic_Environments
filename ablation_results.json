@@ -1,0 +1,86 @@
+{
+  "fc": {
+    "overall_accuracy": 0.3937683449988711,
+    "ece": 0.028962442770408544,
+    "snr_metrics": {
+      "20": {
+        "accuracy": null,
+        "mean_confidence": null,
+        "mean_entropy": null,
+        "count": 0
+      },
+      "10": {
+        "accuracy": 0.4519230769230769,
+        "mean_confidence": 0.37765653141272754,
+        "mean_entropy": 1.9815605253946866,
+        "count": 104
+      },
+      "0": {
+        "accuracy": 0.44166666666666665,
+        "mean_confidence": 0.3499911074837049,
+        "mean_entropy": 2.0343135001541657,
+        "count": 120
+      },
+      "-5": {
+        "accuracy": 0.375,
+        "mean_confidence": 0.3515641246564113,
+        "mean_entropy": 2.0383214263756733,
+        "count": 104
+      },
+      "-10": {
+        "accuracy": 0.41228070175438597,
+        "mean_confidence": 0.397947638115862,
+        "mean_entropy": 1.9188043847030918,
+        "count": 114
+      },
+      "-20": {
+        "accuracy": 0.3333333333333333,
+        "mean_confidence": 0.3132467661379722,
+        "mean_entropy": 2.169009267668395,
+        "count": 114
+      }
+    }
+  },
+  "iqd": {
+    "overall_accuracy": 0.6096184240234817,
+    "ece": 0.035460689702914695,
+    "snr_metrics": {
+      "20": {
+        "accuracy": null,
+        "mean_confidence": null,
+        "mean_entropy": null,
+        "count": 0
+      },
+      "10": {
+        "accuracy": 0.625,
+        "mean_confidence": 0.5851099562759583,
+        "mean_entropy": 1.3192882265930166,
+        "count": 104
+      },
+      "0": {
+        "accuracy": 0.6583333333333333,
+        "mean_confidence": 0.6114739086478949,
+        "mean_entropy": 1.2450285467988578,
+        "count": 120
+      },
+      "-5": {
+        "accuracy": 0.5865384615384616,
+        "mean_confidence": 0.5708376187831163,
+        "mean_entropy": 1.3879158089718588,
+        "count": 104
+      },
+      "-10": {
+        "accuracy": 0.6666666666666666,
+        "mean_confidence": 0.621530301019288,
+        "mean_entropy": 1.208345508008837,
+        "count": 114
+      },
+      "-20": {
+        "accuracy": 0.5789473684210527,
+        "mean_confidence": 0.5411917249623098,
+        "mean_entropy": 1.4866902718543618,
+        "count": 114
+      }
+    }
+  }
+}

@@ -1,8 +1,9 @@
 """Supervised training script for AthenAI.
 
 Supports two modes:
-- base: WavJEPA -> mean pool -> classifier
-- full: WavJEPA + SensorEncoder + CrossAttentionFusion -> classifier
+- base: WavJEPA -> mean pool -> FC classifier  (--decoder fc)
+        WavJEPA -> Intent Query Decoder         (--decoder iqd)
+- full: WavJEPA + SensorEncoder + CrossAttentionFusion -> FC classifier
 
 The script expects data/mixed/metadata.csv and the generated audio/sensor files
 under data/mixed/.
@@ -47,6 +48,11 @@ CommandClassifier = load_symbol(
     "athenai_command_classifier",
     PROJECT_ROOT / "src" / "classification" / "command_classifier.py",
     "CommandClassifier",
+)
+IntentQueryDecoder = load_symbol(
+    "athenai_intent_query_decoder",
+    PROJECT_ROOT / "src" / "classification" / "intent_query_decoder.py",
+    "IntentQueryDecoder",
 )
 WavJEPAEncoder = load_symbol(
     "athenai_audio_jepa",
@@ -134,9 +140,10 @@ class SafetyCommandDataset(Dataset):
 
 
 class AthenAIModel(nn.Module):
-    def __init__(self, mode: str, freeze_audio: bool = True):
+    def __init__(self, mode: str, decoder_type: str = "fc", freeze_audio: bool = True):
         super().__init__()
         self.mode = mode
+        self.decoder_type = decoder_type
         self.audio_encoder = WavJEPAEncoder(freeze_encoder=freeze_audio)
 
         if mode == "full":
@@ -144,12 +151,19 @@ class AthenAIModel(nn.Module):
             self.fusion = CrossAttentionFusion()
             self.classifier = CommandClassifier(input_dim=512)
         else:
-            self.classifier = CommandClassifier(input_dim=768)
+            if decoder_type == "iqd":
+                # IQD receives the full [B, N, 768] sequence — no mean-pool
+                self.classifier = IntentQueryDecoder(
+                    n_commands=len(COMMAND_VOCAB),
+                    query_dim=768,
+                    n_heads=8,
+                    dropout=0.3,
+                )
+            else:
+                self.classifier = CommandClassifier(input_dim=768)
 
     def train(self, mode: bool = True):
         super().train(mode)
-        # Even if unfreezing, keeping audio encoder batchnorm/dropout in eval can sometimes be useful,
-        # but for true fine-tuning we should respect the freeze_encoder state.
         if hasattr(self.audio_encoder, "freeze_encoder") and self.audio_encoder.freeze_encoder:
             self.audio_encoder.eval()
         return self
@@ -159,22 +173,32 @@ class AthenAIModel(nn.Module):
             speech_emb = self.audio_encoder(audio)
         return speech_emb
 
-    def logits_from_features(self, features: torch.Tensor) -> torch.Tensor:
-        logits = self.classifier.fc(features)
-        return logits / self.classifier.temperature
-
     def forward(self, audio: torch.Tensor, sensor: torch.Tensor | None = None) -> torch.Tensor:
-        speech_emb = self.encode_audio(audio)
+        speech_emb = self.encode_audio(audio)   # [B, N, 768]
 
         if self.mode == "full":
             if sensor is None:
                 raise ValueError("sensor tensor is required in full mode")
             sensor_emb = self.sensor_encoder(sensor)
-            features = self.fusion(speech_emb, sensor_emb)
+            features = self.fusion(speech_emb, sensor_emb)          # [B, 512]
+            logits = self.classifier.fc(features) / self.classifier.temperature
+        elif self.decoder_type == "iqd":
+            # IQD: cross-attend full sequence → per-class scores → calibrated logits
+            # Return the raw calibrated logits (before softmax) for CrossEntropyLoss
+            B = speech_emb.size(0)
+            query_ids = torch.arange(
+                self.classifier.class_queries.num_embeddings, device=speech_emb.device
+            )
+            Q = self.classifier.class_queries(query_ids).unsqueeze(0).expand(B, -1, -1)
+            attended, _ = self.classifier.cross_attn(Q, speech_emb, speech_emb)
+            attended = self.classifier.norm(attended + Q)
+            logits = self.classifier.scoring_head(attended).squeeze(-1)  # [B, C]
+            logits = logits / self.classifier.temperature
         else:
-            features = speech_emb.mean(dim=1)
+            features = speech_emb.mean(dim=1)                        # [B, 768]
+            logits = self.classifier.fc(features) / self.classifier.temperature
 
-        return self.logits_from_features(features)
+        return logits
 
 
 @dataclass
@@ -271,6 +295,9 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--mode", type=str, choices=("base", "full"), default="full")
+    parser.add_argument("--decoder", type=str, choices=("fc", "iqd"), default="fc",
+                        help="Classification head: 'fc' = mean-pool + linear (baseline), "
+                             "'iqd' = Intent Query Decoder (cross-attention over full sequence)")
     parser.add_argument("--unfreeze_audio", action="store_true", help="Unfreeze the audio encoder for fine-tuning")
     args = parser.parse_args()
 
@@ -284,12 +311,18 @@ def main() -> None:
 
     project_root = PROJECT_ROOT
     data_dir = project_root / "data" / "mixed"
-    checkpoint_path = project_root / "checkpoints" / "best_model.pt"
+    # Name checkpoint by decoder type so both runs can coexist
+    ckpt_name = f"best_{args.decoder}.pt" if args.mode == "base" else "best_model.pt"
+    checkpoint_path = project_root / "checkpoints" / ckpt_name
 
     dataloaders = build_dataloaders(data_dir, args.batch_size)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AthenAIModel(mode=args.mode, freeze_audio=not args.unfreeze_audio).to(device)
+    model = AthenAIModel(
+        mode=args.mode,
+        decoder_type=args.decoder,
+        freeze_audio=not args.unfreeze_audio,
+    ).to(device)
 
     if args.unfreeze_audio:
         audio_params = [p for n, p in model.named_parameters() if p.requires_grad and "audio_encoder" in n]
@@ -339,7 +372,7 @@ def main() -> None:
             best_epoch = epoch
             patience_counter = 0
             save_checkpoint(checkpoint_path, model, optimizer, epoch, val_loss, args.mode)
-            print(summary + " | best=updated")
+            print(summary + f" [{args.decoder.upper()}] | best=updated")
         else:
             patience_counter += 1
             print(summary + f" | patience={patience_counter}/{patience}")
