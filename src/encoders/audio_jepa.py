@@ -9,7 +9,7 @@ from transformers import AutoFeatureExtractor, AutoModel
 
 
 class WavJEPAEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, freeze_encoder: bool = True):
         super().__init__()
         self.model = AutoModel.from_pretrained(
             'labhamlet/wavjepa-nat-base',
@@ -20,9 +20,11 @@ class WavJEPAEncoder(nn.Module):
             trust_remote_code=True,
         )
 
-        for parameter in self.model.parameters():
-            parameter.requires_grad = False
-        self.model.eval()
+        self.freeze_encoder = freeze_encoder
+        if self.freeze_encoder:
+            for parameter in self.model.parameters():
+                parameter.requires_grad = False
+            self.model.eval()
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
         """
@@ -43,7 +45,9 @@ class WavJEPAEncoder(nn.Module):
         )
         input_values = inputs['input_values'].to(device)
 
-        with torch.no_grad():
+        # Use grad context based on model training mode and freeze setting
+        grad_enabled = torch.is_grad_enabled() and not self.freeze_encoder
+        with torch.set_grad_enabled(grad_enabled):
             outputs = self.model(input_values)
 
         if hasattr(outputs, 'last_hidden_state'):

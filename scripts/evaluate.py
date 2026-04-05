@@ -134,7 +134,7 @@ class SafetyCommandDataset(Dataset):
         sensor_tensor = torch.from_numpy(sensor)
 
         command_idx = int(row["command_idx"])
-        snr_db = int(row["snr_db"])
+        snr_db = int(round(float(row["snr_db"])))
         return waveform, sensor_tensor, command_idx, snr_db
 
 

@@ -134,12 +134,10 @@ class SafetyCommandDataset(Dataset):
 
 
 class AthenAIModel(nn.Module):
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, freeze_audio: bool = True):
         super().__init__()
         self.mode = mode
-        self.audio_encoder = WavJEPAEncoder()
-        for parameter in self.audio_encoder.parameters():
-            parameter.requires_grad = False
+        self.audio_encoder = WavJEPAEncoder(freeze_encoder=freeze_audio)
 
         if mode == "full":
             self.sensor_encoder = SensorEncoder(n_sensors=NUM_SENSORS)
@@ -150,7 +148,10 @@ class AthenAIModel(nn.Module):
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self.audio_encoder.eval()
+        # Even if unfreezing, keeping audio encoder batchnorm/dropout in eval can sometimes be useful,
+        # but for true fine-tuning we should respect the freeze_encoder state.
+        if hasattr(self.audio_encoder, "freeze_encoder") and self.audio_encoder.freeze_encoder:
+            self.audio_encoder.eval()
         return self
 
     def encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
@@ -270,6 +271,7 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--mode", type=str, choices=("base", "full"), default="full")
+    parser.add_argument("--unfreeze_audio", action="store_true", help="Unfreeze the audio encoder for fine-tuning")
     args = parser.parse_args()
 
     warnings.filterwarnings(
@@ -287,10 +289,19 @@ def main() -> None:
     dataloaders = build_dataloaders(data_dir, args.batch_size)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AthenAIModel(mode=args.mode).to(device)
+    model = AthenAIModel(mode=args.mode, freeze_audio=not args.unfreeze_audio).to(device)
 
-    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=1e-4)
+    if args.unfreeze_audio:
+        audio_params = [p for n, p in model.named_parameters() if p.requires_grad and "audio_encoder" in n]
+        head_params = [p for n, p in model.named_parameters() if p.requires_grad and "audio_encoder" not in n]
+        optimizer = torch.optim.AdamW([
+            {"params": audio_params, "lr": 1e-5},    # Ultra-slow LR for massive backbone
+            {"params": head_params, "lr": args.lr}   # Normal LR for heads
+        ], weight_decay=1e-4)
+    else:
+        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=1e-4)
+        
     criterion = nn.CrossEntropyLoss()
 
     best_val_loss = float("inf")
