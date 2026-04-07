@@ -74,7 +74,11 @@ COMMAND_VOCAB = load_symbol(
     PROJECT_ROOT / "src" / "utils" / "vocab.py",
     "COMMAND_VOCAB",
 )
-
+LearnableNoiseFrontend = load_symbol(
+    "athenai_noise_frontend",
+    PROJECT_ROOT / "src" / "encoders" / "noise_frontend.py",
+    "LearnableNoiseFrontend",
+)
 
 TARGET_SAMPLE_RATE = 16000
 TARGET_NUM_SAMPLES = 32000
@@ -140,10 +144,13 @@ class SafetyCommandDataset(Dataset):
 
 
 class AthenAIModel(nn.Module):
-    def __init__(self, mode: str, decoder_type: str = "fc", freeze_audio: bool = True):
+    def __init__(self, mode: str, decoder_type: str = "fc", freeze_audio: bool = True, use_frontend: bool = False):
         super().__init__()
         self.mode = mode
         self.decoder_type = decoder_type
+        self.use_frontend = use_frontend
+        if use_frontend:
+            self.frontend = LearnableNoiseFrontend(channels=16, dropout=0.1)
         self.audio_encoder = WavJEPAEncoder(freeze_encoder=freeze_audio)
 
         if mode == "full":
@@ -169,6 +176,8 @@ class AthenAIModel(nn.Module):
         return self
 
     def encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
+        if self.use_frontend:
+            audio = self.frontend(audio)
         with torch.no_grad():
             speech_emb = self.audio_encoder(audio)
         return speech_emb
@@ -299,6 +308,7 @@ def main() -> None:
                         help="Classification head: 'fc' = mean-pool + linear (baseline), "
                              "'iqd' = Intent Query Decoder (cross-attention over full sequence)")
     parser.add_argument("--unfreeze_audio", action="store_true", help="Unfreeze the audio encoder for fine-tuning")
+    parser.add_argument("--frontend", action="store_true", help="Add learnable noise-suppression frontend before WavJEPA")
     args = parser.parse_args()
 
     warnings.filterwarnings(
@@ -312,7 +322,14 @@ def main() -> None:
     project_root = PROJECT_ROOT
     data_dir = project_root / "data" / "mixed"
     # Name checkpoint by decoder type so both runs can coexist
-    ckpt_name = f"best_{args.decoder}.pt" if args.mode == "base" else "best_model.pt"
+    # ckpt_name = f"best_{args.decoder}.pt" if args.mode == "base" else "best_model.pt"
+    components = [args.mode, args.decoder]
+    if args.frontend:
+        components.append("frontend")
+    if args.unfreeze_audio:
+        components.append("unfrozen")
+
+    ckpt_name = "best_" + "_".join(components) + ".pt"
     checkpoint_path = project_root / "checkpoints" / ckpt_name
 
     dataloaders = build_dataloaders(data_dir, args.batch_size)
@@ -322,6 +339,7 @@ def main() -> None:
         mode=args.mode,
         decoder_type=args.decoder,
         freeze_audio=not args.unfreeze_audio,
+        use_frontend=args.frontend,
     ).to(device)
 
     if args.unfreeze_audio:
@@ -332,14 +350,36 @@ def main() -> None:
             {"params": head_params, "lr": args.lr}   # Normal LR for heads
         ], weight_decay=1e-4)
     else:
-        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-        optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=1e-4)
-        
+        # New — separate learning rates per component
+        if hasattr(model, 'frontend') and model.use_frontend:
+            frontend_params = list(model.frontend.parameters())
+            frontend_ids = set(id(p) for p in frontend_params)
+            other_params = [p for p in model.parameters() 
+                            if p.requires_grad and id(p) not in frontend_ids]
+            
+            optimizer = torch.optim.AdamW([
+                {"params": frontend_params, "lr": 1e-4},   # slower for frontend
+                {"params": other_params,    "lr": args.lr}, # normal for IQD
+            ], weight_decay=1e-4)
+        else:
+            trainable_parameters = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=1e-4)
+        # trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        # optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=1e-4)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min',          # reduce when val_loss stops improving
+        factor=0.5,          # halve the lr
+        patience=5,          # wait 5 epochs before reducing
+        min_lr=1e-6
+    )
+
     criterion = nn.CrossEntropyLoss()
 
     best_val_loss = float("inf")
     best_epoch = -1
-    patience = 10
+    patience = 20
     patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -360,6 +400,8 @@ def main() -> None:
             optimizer=None,
             desc=f"Epoch {epoch:03d} Val",
         )
+
+        scheduler.step(val_loss)
 
         summary = (
             f"Epoch {epoch:03d} | "
