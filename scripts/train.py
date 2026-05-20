@@ -1,9 +1,13 @@
 """Supervised training script for AthenAI.
 
-Supports two modes:
-- base: WavJEPA -> mean pool -> FC classifier  (--decoder fc)
-        WavJEPA -> Intent Query Decoder         (--decoder iqd)
-- full: WavJEPA + SensorEncoder + CrossAttentionFusion -> FC classifier
+Two modes — both use the Intent Query Decoder (IQD):
+  base: WavJEPA[B, N,   768] → IQD → [B, 20]
+  full: WavJEPA[B, N,   768] ─┐
+        Sensor [B, 128, 768] ─┴→ cat[B, N+128, 768] → IQD → [B, 20]
+
+In full mode, the dense multivariate sensor sequence is projected step-by-step
+to the audio embedding dimension and concatenated. This gives the IQD cross-attention
+joint access to the dense spatio-temporal dynamics across both modalities.
 
 The script expects data/mixed/metadata.csv and the generated audio/sensor files
 under data/mixed/.
@@ -44,11 +48,6 @@ def load_symbol(module_name: str, file_path: Path, symbol_name: str):
     return getattr(module, symbol_name)
 
 
-CommandClassifier = load_symbol(
-    "athenai_command_classifier",
-    PROJECT_ROOT / "src" / "classification" / "command_classifier.py",
-    "CommandClassifier",
-)
 IntentQueryDecoder = load_symbol(
     "athenai_intent_query_decoder",
     PROJECT_ROOT / "src" / "classification" / "intent_query_decoder.py",
@@ -63,11 +62,6 @@ SensorEncoder = load_symbol(
     "athenai_sensor_encoder",
     PROJECT_ROOT / "src" / "encoders" / "sensor_encoder.py",
     "SensorEncoder",
-)
-CrossAttentionFusion = load_symbol(
-    "athenai_cross_attention_fusion",
-    PROJECT_ROOT / "src" / "fusion" / "cross_attention_fusion.py",
-    "CrossAttentionFusion",
 )
 COMMAND_VOCAB = load_symbol(
     "athenai_vocab",
@@ -139,66 +133,79 @@ class SafetyCommandDataset(Dataset):
         return waveform, sensor_tensor, command_idx
 
 
+# Audio embedding dimension produced by WavJEPA
+AUDIO_DIM = 768
+# Sensor encoder output dimension (from SensorEncoder embed_dim=256)
+SENSOR_DIM = 256
+
+
 class AthenAIModel(nn.Module):
-    def __init__(self, mode: str, decoder_type: str = "fc", freeze_audio: bool = True):
+    """
+    Unified AthenAI model — both modes use the Intent Query Decoder.
+
+    base:  WavJEPA[B, N, 768]                          → IQD(audio) → [B, n_commands]
+    full:  WavJEPA[B, N, 768]                          ┐
+           SensorEnc[B, T, 768]                        ┘ IQD(audio, sensor) → [B, n_commands]
+
+    The decoder now uses dual-stream attention: one for audio and one for sensors.
+    The resulting class-query hypotheses are fused using a Transformer block.
+    This prevents the noisy sensor signal from drowning out the audio features.
+    """
+
+    def __init__(self, mode: str = "full", freeze_audio: bool = True, use_lora: bool = False, n_layers: int = 2):
         super().__init__()
+        assert mode in ("base", "full"), f"mode must be 'base' or 'full', got '{mode}'"
         self.mode = mode
-        self.decoder_type = decoder_type
-        self.audio_encoder = WavJEPAEncoder(freeze_encoder=freeze_audio)
 
+        # ── Audio backbone ────────────────────────────────────────────────────
+        self.audio_encoder = WavJEPAEncoder(freeze_encoder=freeze_audio, use_lora=use_lora)
+
+        # ── Sensor pathway (full mode only) ───────────────────────────────────
         if mode == "full":
-            self.sensor_encoder = SensorEncoder(n_sensors=NUM_SENSORS)
-            self.fusion = CrossAttentionFusion()
-            self.classifier = CommandClassifier(input_dim=512)
-        else:
-            if decoder_type == "iqd":
-                # IQD receives the full [B, N, 768] sequence — no mean-pool
-                self.classifier = IntentQueryDecoder(
-                    n_commands=len(COMMAND_VOCAB),
-                    query_dim=768,
-                    n_heads=8,
-                    dropout=0.3,
-                )
-            else:
-                self.classifier = CommandClassifier(input_dim=768)
+            self.sensor_encoder = SensorEncoder(n_sensors=NUM_SENSORS)  # → [B, 256]
+            # Project sensor vector to match audio embedding dim for prepending
+            self.sensor_proj = nn.Linear(SENSOR_DIM, AUDIO_DIM)
 
+        # ── Intent Query Decoder (shared by both modes) ───────────────────────
+        self.decoder = IntentQueryDecoder(
+            n_commands=len(COMMAND_VOCAB),
+            query_dim=AUDIO_DIM,
+            n_heads=8,
+            dropout=0.3,
+            n_layers=n_layers,
+        )
+
+    # Keep .train() override so frozen WavJEPA stays in eval mode during training
     def train(self, mode: bool = True):
         super().train(mode)
         if hasattr(self.audio_encoder, "freeze_encoder") and self.audio_encoder.freeze_encoder:
             self.audio_encoder.eval()
         return self
 
-    def encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            speech_emb = self.audio_encoder(audio)
-        return speech_emb
+    def _build_sequences(self, audio: torch.Tensor, sensor: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Prepare the individual modal sequences for the dual-stream IQD.
 
-    def forward(self, audio: torch.Tensor, sensor: torch.Tensor | None = None) -> torch.Tensor:
-        speech_emb = self.encode_audio(audio)   # [B, N, 768]
+        Returns:
+            speech_seq: [B, N, 768]
+            sensor_seq: [B, T, 768] (or None)
+        """
+        speech_seq = self.audio_encoder(audio)                        # [B, N, 768]
+        sensor_seq = None
 
         if self.mode == "full":
             if sensor is None:
-                raise ValueError("sensor tensor is required in full mode")
-            sensor_emb = self.sensor_encoder(sensor)
-            features = self.fusion(speech_emb, sensor_emb)          # [B, 512]
-            logits = self.classifier.fc(features) / self.classifier.temperature
-        elif self.decoder_type == "iqd":
-            # IQD: cross-attend full sequence → per-class scores → calibrated logits
-            # Return the raw calibrated logits (before softmax) for CrossEntropyLoss
-            B = speech_emb.size(0)
-            query_ids = torch.arange(
-                self.classifier.class_queries.num_embeddings, device=speech_emb.device
-            )
-            Q = self.classifier.class_queries(query_ids).unsqueeze(0).expand(B, -1, -1)
-            attended, _ = self.classifier.cross_attn(Q, speech_emb, speech_emb)
-            attended = self.classifier.norm(attended + Q)
-            logits = self.classifier.scoring_head(attended).squeeze(-1)  # [B, C]
-            logits = logits / self.classifier.temperature
-        else:
-            features = speech_emb.mean(dim=1)                        # [B, 768]
-            logits = self.classifier.fc(features) / self.classifier.temperature
+                raise ValueError("sensor tensor required in full mode")
+            # Dense sequence embeddings
+            s_emb = self.sensor_encoder(sensor)                       # [B, T, 256]
+            sensor_seq = self.sensor_proj(s_emb)                      # [B, T, 768]
 
-        return logits
+        return speech_seq, sensor_seq
+
+    def forward(self, audio: torch.Tensor, sensor: torch.Tensor | None = None) -> torch.Tensor:
+        """Returns calibrated logits [B, n_commands] for CrossEntropyLoss."""
+        speech_seq, sensor_seq = self._build_sequences(audio, sensor)
+        return self.decoder.logits(speech_seq, sensor_seq)            # [B, n_commands]
 
 
 @dataclass
@@ -254,6 +261,9 @@ def run_epoch(
 
             if is_train:
                 loss.backward()
+                # ── Stability Fix: Gradient Clipping ──────────────────────────
+                # Prevents Nan gradients in deep cross-attention layers
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
         batch_size = targets.size(0)
@@ -291,14 +301,14 @@ def load_checkpoint(path: Path, model: AthenAIModel, device: torch.device) -> Di
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Supervised training for AthenAI")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--mode", type=str, choices=("base", "full"), default="full")
-    parser.add_argument("--decoder", type=str, choices=("fc", "iqd"), default="fc",
-                        help="Classification head: 'fc' = mean-pool + linear (baseline), "
-                             "'iqd' = Intent Query Decoder (cross-attention over full sequence)")
-    parser.add_argument("--unfreeze_audio", action="store_true", help="Unfreeze the audio encoder for fine-tuning")
+    parser.add_argument("--epochs",       type=int,   default=30)
+    parser.add_argument("--batch_size",   type=int,   default=16)
+    parser.add_argument("--lr",           type=float, default=1e-4)
+    parser.add_argument("--mode",         type=str,   choices=("base", "full"), default="full")
+    parser.add_argument("--n_layers",     type=int,   default=2,
+                        help="Stacked IQD cross-attention layers (default: 2)")
+    parser.add_argument("--unfreeze_audio", action="store_true",
+                        help="Unfreeze WavJEPA backbone for domain fine-tuning")
     args = parser.parse_args()
 
     warnings.filterwarnings(
@@ -312,7 +322,7 @@ def main() -> None:
     project_root = PROJECT_ROOT
     data_dir = project_root / "data" / "mixed"
     # Name checkpoint by decoder type so both runs can coexist
-    ckpt_name = f"best_{args.decoder}.pt" if args.mode == "base" else "best_model.pt"
+    ckpt_name = f"best_model_{args.mode}.pt"
     checkpoint_path = project_root / "checkpoints" / ckpt_name
 
     dataloaders = build_dataloaders(data_dir, args.batch_size)
@@ -320,22 +330,34 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = AthenAIModel(
         mode=args.mode,
-        decoder_type=args.decoder,
         freeze_audio=not args.unfreeze_audio,
+        use_lora=args.unfreeze_audio,  # Activating fine-tuning automatically activates LoRA
+        n_layers=args.n_layers,
     ).to(device)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    frozen    = [p for p in model.parameters() if not p.requires_grad]
+    print(f"Mode: {args.mode} | IQD layers: {args.n_layers} | "
+          f"Trainable: {sum(p.numel() for p in trainable):,} | "
+          f"Frozen: {sum(p.numel() for p in frozen):,}")
 
     if args.unfreeze_audio:
         audio_params = [p for n, p in model.named_parameters() if p.requires_grad and "audio_encoder" in n]
-        head_params = [p for n, p in model.named_parameters() if p.requires_grad and "audio_encoder" not in n]
+        head_params  = [p for n, p in model.named_parameters() if p.requires_grad and "audio_encoder" not in n]
         optimizer = torch.optim.AdamW([
-            {"params": audio_params, "lr": 1e-5},    # Ultra-slow LR for massive backbone
-            {"params": head_params, "lr": args.lr}   # Normal LR for heads
+            {"params": audio_params, "lr": 1e-5},   # slow LR for backbone
+            {"params": head_params,  "lr": args.lr}, # normal LR for IQD+sensor
         ], weight_decay=1e-4)
     else:
-        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-        optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=1e-4)
-        
-    criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
+
+    # Cosine annealing: smoothly decays LR to eta_min over all epochs,
+    # allowing the model to settle into a sharper minimum instead of oscillating.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6
+    )
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
     best_val_loss = float("inf")
     best_epoch = -1
@@ -351,6 +373,7 @@ def main() -> None:
             optimizer=optimizer,
             desc=f"Epoch {epoch:03d} Train",
         )
+
 
         val_loss, val_accuracy, _, _ = run_epoch(
             model=model,
@@ -372,13 +395,15 @@ def main() -> None:
             best_epoch = epoch
             patience_counter = 0
             save_checkpoint(checkpoint_path, model, optimizer, epoch, val_loss, args.mode)
-            print(summary + f" [{args.decoder.upper()}] | best=updated")
+            print(summary + f" [IQD-{args.mode.upper()}] | lr={scheduler.get_last_lr()[0]:.2e} | best=updated")
         else:
             patience_counter += 1
-            print(summary + f" | patience={patience_counter}/{patience}")
+            print(summary + f" | lr={scheduler.get_last_lr()[0]:.2e} | patience={patience_counter}/{patience}")
             if patience_counter >= patience:
                 print(f"Early stopping triggered at epoch {epoch}; best epoch was {best_epoch}")
                 break
+
+        scheduler.step()  # Decay LR after each epoch (cosine annealing)
 
     load_checkpoint(checkpoint_path, model, device)
 

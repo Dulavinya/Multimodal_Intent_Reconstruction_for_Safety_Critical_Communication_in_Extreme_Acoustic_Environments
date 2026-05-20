@@ -42,3 +42,4 @@ scratchpad/
 
 #data files
 data/
+*.log

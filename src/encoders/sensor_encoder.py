@@ -28,16 +28,12 @@ class SensorEncoder(nn.Module):
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, seq_len, n_sensors]  — multivariate sensor time-series window
         Returns:
-            [B, embed_dim]  — pooled sensor embedding
+            [B, seq_len, embed_dim]  — dense unpooled sensor embedding sequence
         """
         x = self.input_proj(x) + self.pos_enc   # [B, seq_len, embed_dim]
-        x = self.transformer(x)                  # [B, seq_len, embed_dim]
-        x = self.pool(x.transpose(1, 2)).squeeze(-1)  # [B, embed_dim]
-        return x
+        return self.transformer(x)               # [B, seq_len, embed_dim]

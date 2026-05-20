@@ -9,7 +9,7 @@ from transformers import AutoFeatureExtractor, AutoModel
 
 
 class WavJEPAEncoder(nn.Module):
-    def __init__(self, freeze_encoder: bool = True):
+    def __init__(self, freeze_encoder: bool = True, use_lora: bool = False):
         super().__init__()
         self.model = AutoModel.from_pretrained(
             'labhamlet/wavjepa-nat-base',
@@ -21,7 +21,21 @@ class WavJEPAEncoder(nn.Module):
         )
 
         self.freeze_encoder = freeze_encoder
-        if self.freeze_encoder:
+        self.use_lora = use_lora
+
+        if self.use_lora:
+            from peft import LoraConfig, get_peft_model
+            config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                target_modules="all-linear",
+                bias="none"
+            )
+            # Apply PEFT wrapper; automatically freezes base weights and injects LoRA matrices
+            self.model = get_peft_model(self.model, config)
+            self.freeze_encoder = False  # Enable grad context in forward pass for LoRA adapters
+
+        elif self.freeze_encoder:
             for parameter in self.model.parameters():
                 parameter.requires_grad = False
             self.model.eval()

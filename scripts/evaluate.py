@@ -43,16 +43,6 @@ def load_symbol(module_name: str, file_path: Path, symbol_name: str):
     return getattr(module, symbol_name)
 
 
-CommandClassifier = load_symbol(
-    "athenai_command_classifier_eval",
-    PROJECT_ROOT / "src" / "classification" / "command_classifier.py",
-    "CommandClassifier",
-)
-mc_dropout_inference = load_symbol(
-    "athenai_command_classifier_eval",
-    PROJECT_ROOT / "src" / "classification" / "command_classifier.py",
-    "mc_dropout_inference",
-)
 IntentQueryDecoder = load_symbol(
     "athenai_intent_query_decoder_eval",
     PROJECT_ROOT / "src" / "classification" / "intent_query_decoder.py",
@@ -72,11 +62,6 @@ SensorEncoder = load_symbol(
     "athenai_sensor_encoder_eval",
     PROJECT_ROOT / "src" / "encoders" / "sensor_encoder.py",
     "SensorEncoder",
-)
-CrossAttentionFusion = load_symbol(
-    "athenai_cross_attention_fusion_eval",
-    PROJECT_ROOT / "src" / "fusion" / "cross_attention_fusion.py",
-    "CrossAttentionFusion",
 )
 COMMAND_VOCAB = load_symbol(
     "athenai_vocab_eval",
@@ -148,45 +133,46 @@ class SafetyCommandDataset(Dataset):
         return waveform, sensor_tensor, command_idx, snr_db
 
 
+AUDIO_DIM  = 768
+SENSOR_DIM = 256
+
+
 class AthenAIModel(nn.Module):
-    def __init__(self, mode: str, decoder_type: str = "fc"):
+    """Mirrors the unified architecture in scripts/train.py."""
+
+    def __init__(self, mode: str = "full", use_lora: bool = False, n_layers: int = 2):
         super().__init__()
         self.mode = mode
-        self.decoder_type = decoder_type
-        self.audio_encoder = WavJEPAEncoder()
-        for parameter in self.audio_encoder.parameters():
-            parameter.requires_grad = False
+        self.audio_encoder = WavJEPAEncoder(freeze_encoder=True, use_lora=use_lora)
+        for p in self.audio_encoder.parameters():
+            p.requires_grad = False
 
         if mode == "full":
             self.sensor_encoder = SensorEncoder(n_sensors=NUM_SENSORS)
-            self.fusion = CrossAttentionFusion()
-            self.classifier = CommandClassifier(input_dim=512)
-        else:
-            if decoder_type == "iqd":
-                self.classifier = IntentQueryDecoder(
-                    n_commands=len(COMMAND_VOCAB),
-                    query_dim=768,
-                    n_heads=8,
-                    dropout=0.3,
-                )
-            else:
-                self.classifier = CommandClassifier(input_dim=768)
+            self.sensor_proj = nn.Linear(SENSOR_DIM, AUDIO_DIM)
 
-    def forward_features(self, audio: torch.Tensor, sensor: torch.Tensor | None = None) -> torch.Tensor:
+        self.decoder = IntentQueryDecoder(
+            n_commands=len(COMMAND_VOCAB),
+            query_dim=AUDIO_DIM,
+            n_heads=8,
+            dropout=0.3,
+            n_layers=n_layers,
+        )
+
+    def _build_sequences(self, audio: torch.Tensor, sensor: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
         with torch.no_grad():
-            speech_emb = self.audio_encoder(audio)
-
+            speech_seq = self.audio_encoder(audio)   # [B, N, 768]
+        sensor_seq = None
         if self.mode == "full":
             if sensor is None:
-                raise ValueError("sensor tensor is required in full mode")
-            sensor_emb = self.sensor_encoder(sensor)
-            return self.fusion(speech_emb, sensor_emb)
+                raise ValueError("sensor required in full mode")
+            s_emb = self.sensor_encoder(sensor)              # [B, T, 256]
+            sensor_seq = self.sensor_proj(s_emb)             # [B, T, 768]
+        return speech_seq, sensor_seq
 
-        if self.decoder_type == "iqd":
-            # Return full sequence for IQD — do NOT mean-pool
-            return speech_emb
-
-        return speech_emb.mean(dim=1)
+    def forward(self, audio: torch.Tensor, sensor: torch.Tensor | None = None) -> torch.Tensor:
+        speech_seq, sensor_seq = self._build_sequences(audio, sensor)
+        return self.decoder.logits(speech_seq, sensor_seq)
 
 
 def build_test_loader(data_dir: Path, batch_size: int) -> DataLoader:
@@ -310,9 +296,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate AthenAI on the test split")
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "checkpoints" / "best_model.pt")
     parser.add_argument("--mode", type=str, choices=("base", "full"), default="full")
-    parser.add_argument("--decoder", type=str, choices=("fc", "iqd"), default="fc",
-                        help="'iqd' for Intent Query Decoder, 'fc' for FC baseline")
+    parser.add_argument("--n_layers", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--use_lora", action="store_true", help="Instantiate model with LoRA wrappers before loading checkpoint weights.")
     args = parser.parse_args()
 
     set_seed(42)
@@ -321,7 +307,7 @@ def main() -> None:
     test_loader = build_test_loader(data_dir, args.batch_size)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AthenAIModel(mode=args.mode, decoder_type=args.decoder).to(device)
+    model = AthenAIModel(mode=args.mode, use_lora=args.use_lora, n_layers=args.n_layers).to(device)
     load_checkpoint(args.checkpoint, model, device)
     model.eval()
 
@@ -333,26 +319,16 @@ def main() -> None:
 
     with torch.no_grad():
         for audio, sensor, targets, snr_db in test_loader:
-            audio = audio.to(device, non_blocking=True)
+            audio  = audio.to(device, non_blocking=True)
             sensor = sensor.to(device, non_blocking=True)
 
-            if model.mode == "full":
-                features = model.forward_features(audio, sensor)
-            else:
-                features = model.forward_features(audio)
+            seq = model._build_sequence(audio, sensor)
 
-            if model.decoder_type == "iqd":
-                pred_cmd, confidence, uncertainty = mc_dropout_inference_iqd(
-                    model.classifier,
-                    features,
-                    n_passes=20,
-                )
-            else:
-                pred_cmd, confidence, uncertainty = mc_dropout_inference(
-                    model.classifier,
-                    features,
-                    n_passes=20,
-                )
+            pred_cmd, confidence, uncertainty = mc_dropout_inference_iqd(
+                model.decoder,
+                seq,
+                n_passes=20,
+            )
 
             all_targets.extend(targets.tolist())
             all_predictions.extend(pred_cmd.detach().cpu().tolist())
