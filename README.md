@@ -23,7 +23,7 @@ Project repository for the hackathon submission: robustly inferring short safety
 
 ## Architecture
 
-![Architecture](Architecture.jpeg)
+![Architecture](src/diagram.jpeg)
 
 **Generative AI Application**
 - **Representation learning**: Use self-supervised / generative representation learning on raw audio (masked predictive objectives). Models/ideas: `wav2vec 2.0`, `HuBERT`, CPC, or research-style masked predictive encoders inspired by AJEPA. These learn features that are robust to corruption/noise.
